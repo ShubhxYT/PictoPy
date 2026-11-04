@@ -8,8 +8,10 @@ import json
 import os
 import sqlite3
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -392,6 +394,75 @@ class TestRescanningAFolder:
         conn.close()
 
         assert before == after
+
+    def test_affected_modes_index_and_rescan_without_regeneration(
+        self, library: Path, generated: List[str], test_db: str
+    ) -> None:
+        la_path = library / "alpha.png"
+        sixteen_path = library / "sixteen.png"
+        Image.new("LA", (960, 480), (120, 128)).save(la_path)
+        pixels = np.tile(np.linspace(0, 65535, 960, dtype=np.uint16), (480, 1))
+        Image.fromarray(pixels).save(sixteen_path)
+        (library / "corrupt.png").write_bytes(b"not a png")
+        with Image.open(la_path) as source:
+            assert source.mode == "LA"
+        with Image.open(sixteen_path) as source:
+            assert source.mode == "I;16"
+        expected_paths = {
+            str(path) for path in library.iterdir() if path.name != "corrupt.png"
+        }
+        folder_data = [(str(library), "folder-1", False)]
+
+        assert image_util_process_folder_images(folder_data) is True
+        assert set(generated) == expected_paths
+        assert len(generated) == len(expected_paths)
+        with sqlite3.connect(test_db) as conn:
+            before = conn.execute(
+                "SELECT path, id, thumbnailPath FROM images"
+            ).fetchall()
+        assert {row[0] for row in before} == expected_paths
+        assert len(before) == len(expected_paths)
+        thumbnail_bytes = {}
+        for _, _, thumbnail_path in before:
+            with Image.open(thumbnail_path) as thumbnail:
+                assert thumbnail.format == "JPEG"
+                thumbnail.load()
+            thumbnail_bytes[thumbnail_path] = Path(thumbnail_path).read_bytes()
+
+        generated.clear()
+        assert image_util_process_folder_images(folder_data) is True
+
+        assert generated == []
+        with sqlite3.connect(test_db) as conn:
+            after = conn.execute(
+                "SELECT path, id, thumbnailPath FROM images"
+            ).fetchall()
+        assert sorted(after) == sorted(before)
+        assert {
+            path: Path(path).read_bytes() for path in thumbnail_bytes
+        } == thumbnail_bytes
+
+    @pytest.mark.parametrize("mode", ["I", "F"])
+    def test_numeric_tiffs_produce_prepared_records(
+        self, library: Path, mode: str
+    ) -> None:
+        source_path = library / f"numeric-{mode}.tiff"
+        dtype = np.int32 if mode == "I" else np.float32
+        samples = np.linspace(-1000, 2000, 960, dtype=dtype)
+        Image.fromarray(np.tile(samples, (480, 1))).save(source_path)
+        with Image.open(source_path) as source:
+            assert source.mode == mode
+
+        records = image_util_prepare_image_records(
+            [str(source_path)], {str(library): "folder-1"}
+        )
+
+        assert len(records) == 1
+        assert records[0]["path"] == str(source_path)
+        with Image.open(records[0]["thumbnailPath"]) as thumbnail:
+            assert thumbnail.format == "JPEG"
+            thumbnail.load()
+            assert thumbnail.size == (600, 300)
 
 
 class TestExtractMetadataRecordsMtime:

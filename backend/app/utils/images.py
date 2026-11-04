@@ -8,6 +8,7 @@ import json
 import logging
 import sqlite3
 
+import numpy as np
 from PIL import Image, ExifTags
 from pathlib import Path
 
@@ -450,19 +451,36 @@ def image_util_get_images_from_folder(
     return image_files
 
 
+def _image_util_normalize_thumbnail_mode(img: Image.Image) -> Image.Image:
+    """Prepare numeric previews and other unsupported modes for JPEG output."""
+    if img.mode in ("I", "F") or img.mode.startswith("I;16"):
+        # Scale before resizing: 16-bit modes cannot use Pillow's default filter.
+        pixels = np.asarray(img, dtype=np.float64)
+        finite = np.isfinite(pixels)
+        preview = np.zeros(pixels.shape, dtype=np.uint8)
+        if finite.any():
+            values = pixels[finite]
+            minimum = float(values.min())
+            maximum = float(values.max())
+            if maximum > minimum:
+                values = (values - minimum) / (maximum - minimum) * 255.0
+            preview[finite] = np.clip(values, 0, 255).astype(np.uint8)
+        return Image.fromarray(preview, mode="L")
+
+    if img.mode not in ("1", "L", "RGB", "RGBX", "CMYK", "YCbCr"):
+        return img.convert("RGB")
+    return img
+
+
 def image_util_generate_thumbnail(
     image_path: str, thumbnail_path: str, size: Tuple[int, int] = (600, 600)
 ) -> bool:
     """Generate thumbnail for a single image."""
     try:
         with Image.open(image_path) as img:
-            img.thumbnail(size)
-
-            # Convert to RGB if the image has an alpha channel or is not RGB
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-
-            img.save(thumbnail_path, "JPEG")  # Always save thumbnails as JPEG
+            thumbnail = _image_util_normalize_thumbnail_mode(img)
+            thumbnail.thumbnail(size)
+            thumbnail.save(thumbnail_path, "JPEG")
         return True
     except Exception as e:
         logger.error(f"Error generating thumbnail for {image_path}: {e}")
